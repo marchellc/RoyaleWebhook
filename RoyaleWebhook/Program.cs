@@ -5,7 +5,6 @@ using CommonLib.Utilities;
 
 using System.Collections.Generic;
 using System.Threading.Tasks;
-using System.Net.Sockets;
 using System.Net.Http;
 using System.Drawing;
 using System.Linq;
@@ -13,8 +12,10 @@ using System.IO;
 using System;
 
 using RoyaleAPI;
-using RoyaleAPI.Objects.Ips;
-using RoyaleAPI.Objects.Attacks;
+using RoyaleAPI.Features;
+using RoyaleAPI.Objects.Enums;
+using RoyaleAPI.Objects.Attacks.Responses;
+using RoyaleAPI.Objects.Ip.Responses;
 
 using SimpleWebhooks;
 using SimpleWebhooks.Embeds;
@@ -36,7 +37,7 @@ namespace RoyaleWebhook
         public static AttackWatcher Watcher { get; set; }
 
         public static HttpClient Http { get; set; }
-        public static IpList Ips { get; set; }
+        public static GetIPsResponse Ips { get; set; }
 
         [Config("Interval", "Attack list refresh interval (in ms).")]
         public static double Interval { get; set; } = 5000;
@@ -63,10 +64,10 @@ namespace RoyaleWebhook
                 Log = new LogOutput("Royale Webhook").Setup();
                 Log.Info("Initialized! Loading config ..");
 
-                Config = new ConfigFile($"{Directory.GetCurrentDirectory()}/config.json");
+                Config = new ConfigFile($"{Directory.GetCurrentDirectory()}/royale_config.ini");
 
-                Config.Serializer = value => value.JsonSerialize();
-                Config.Deserializer = (value, type) => value.JsonDeserialize(type);
+                Config.Serializer = value => value.JsonSerialize(true);
+                Config.Deserializer = (value, type) => value.JsonDeserialize(type, true);
 
                 if (!Config.Bind())
                     Log.Warn("Failed to bind config keys.");
@@ -89,14 +90,13 @@ namespace RoyaleWebhook
                 Client = new RoyaleClient(ApiKey);
                 Client.InitializeClient(Http, msg => Log.Info(msg));
 
-                Ips = await Client.GetIpsAsync();
+                Ips = await Client.GetIPsAsync();
 
-                Log.Info($"Received {Ips.Count} IPs.");
+                Log.Info($"Received {Ips.Total} IPs.");
                 Log.Info("Client initialized, starting attack watcher");
 
                 Watcher = new AttackWatcher(Client);
 
-                Watcher.OnAttackListRefreshed += OnAttackListRefreshed;
                 Watcher.OnAttackDetected += OnAttackStarted;
                 Watcher.OnAttackEnded += OnAttackEnded;
                 Watcher.OnError += OnError;
@@ -118,12 +118,7 @@ namespace RoyaleWebhook
             Log.Error(obj);
         }
 
-        private static void OnAttackListRefreshed(AttackList obj)
-        {
-            Log.Info($"Attack list refreshed ({obj.Attacks.Length} attacks)");
-        }
-
-        private static void OnAttackEnded(AttackResponse obj)
+        private static void OnAttackEnded(GetAttackResponse obj)
         {
             Task.Run(async () =>
             {
@@ -134,7 +129,7 @@ namespace RoyaleWebhook
             });
         }
 
-        private static void OnAttackStarted(AttackResponse obj)
+        private static void OnAttackStarted(GetAttackResponse obj)
         {
             Task.Run(async () =>
             {
@@ -194,7 +189,7 @@ namespace RoyaleWebhook
             {
                 try
                 {
-                    var attacks = await Client.GetAttacksAsync();
+                    var attacks = await Client.GetAttacksAsync(0);
                     var latest = attacks.Attacks.First();
                     var info = await Client.GetAttackAsync(latest.Id);
                     var message = ToMessage(info);
@@ -211,7 +206,7 @@ namespace RoyaleWebhook
             return "Requesting attacks ..";
         }
 
-        private static DiscordMessage ToMessage(AttackResponse response, string content = null)
+        private static DiscordMessage ToMessage(GetAttackResponse response, string content = null)
         {
             var message = new DiscordMessage();
 
@@ -223,44 +218,45 @@ namespace RoyaleWebhook
             return message;
         }
 
-        private static DiscordEmbed ToEmbed(AttackResponse attackResponse)
+        private static DiscordEmbed ToEmbed(GetAttackResponse attackResponse)
         {
             var embed = new DiscordEmbed();
 
-            if (attackResponse.Attack.HasEnded)
+            if (attackResponse.BaseInfo.Status is AttackStatus.Ended)
             {
                 embed.WithTitle("✅ | Útok skončil");
                 embed.WithColor(Color.Green);
+
+                embed.WithField("🌐 | IP", attackResponse.BaseInfo.Destination, false);
+                embed.WithField("🔗 | Typ", attackResponse.BaseInfo.Description, false);
+
+                embed.WithField("🕒 | Začátek", attackResponse.BaseInfo.StartTime, false);
+                embed.WithField("🕒 | Konec", attackResponse.BaseInfo.EventTime, false);
+                embed.WithField("🕒 | Délka", $"{attackResponse.BaseInfo.Duration.TotalSeconds} sekund", false);
+
+                embed.WithField("📶 | Celková data", $"{attackResponse.BaseInfo.Dropped} Mb", false);
+                embed.WithField("📶 | Maximální síla", $"{attackResponse.BaseInfo.MegaBitsPerSecond} Mbps | {attackResponse.BaseInfo.PacketsPerSecond} Pps", false);
             }
             else
             {
                 embed.WithTitle("⚠️ | Útok detekován");
                 embed.WithColor(Color.Red);
+
+                embed.WithField("🌐 | IP", attackResponse.BaseInfo.Destination, false);
+                embed.WithField("🔗 | Typ", attackResponse.BaseInfo.Description, false);
+                embed.WithField("🕒 | Začátek", attackResponse.BaseInfo.StartTime, false);
+                embed.WithField("📶 | Počáteční síla", $"{attackResponse.BaseInfo.MegaBitsPerSecond} Mbps | {attackResponse.BaseInfo.PacketsPerSecond} Pps", false);
             }
 
-            embed.WithField("🌐 | IP", attackResponse.Attack.Target, false);
-            embed.WithField("🔗 | Typ", attackResponse.Attack.Description, false);
-            embed.WithField("📶 | Síla", $"{attackResponse.Attack.Mbps} Mbps | {attackResponse.Attack.Pps} Pps", false);
-            embed.WithField("🕒 | Začátek", attackResponse.Attack.StartedAtString, false);
+            embed.WithField("📡 | Cílové porty", string.Join("\n", attackResponse.ExtendedInfo.DestinationPorts.Where(p => p.Name != "other").Select(p => p.Name)), false);
+            embed.WithField("📡 | Zdrojové porty", string.Join("\n", attackResponse.ExtendedInfo.SourcePorts.Where(p => p.Name != "other").Select(p => p.Name)), false);
 
-            if (attackResponse.Attack.HasEnded)
-            {
-                embed.WithField("🕒 | Délka", $"{attackResponse.Attack.TotalDuration} sekund", false);
-                embed.WithField("📶 | Celková data", $"{attackResponse.Attack.TotalVolume} Mb", false);
-            }
+            embed.WithField("📡 | Zdrojové IP", string.Join("\n", attackResponse.ExtendedInfo.SourceIPs.Where(p => p.Name != "other").Select(p => p.Name)), false);
+            embed.WithField("📡 | Zdrojové ASN", string.Join("\n", attackResponse.ExtendedInfo.SourceASNs.Where(p => p.Name != "other").Select(p => p.Name)), false);
 
-            embed.WithField("📡 | Cílové porty", string.Join("\n", attackResponse.Info.DestinationPorts.Where(p => p.Name != "other").Select(p => p.Name)), false);
-            embed.WithField("📡 | Zdrojové porty", string.Join("\n", attackResponse.Info.SourcePorts.Where(p => p.Name != "other").Select(p => p.Name)), false);
+            embed.WithField("🌐 | Státy", string.Join("\n", attackResponse.ExtendedInfo.SourceCountries.Where(p => p.Name != "other").Select(p => p.Name)), false);
 
-            embed.WithField("🔗 | Protokoly", string.Join("\n", attackResponse.Info.Protocols.Where(p => p.Name != "other").Select(p => (ProtocolType)int.Parse(p.Name))), false);
-            embed.WithField("🔗 | Data", string.Join("\n", attackResponse.Info.Packets.Where(p => p.Name != "other").Select(p => p.Name)));
-
-            embed.WithField("📡 | Zdrojové IP", string.Join("\n", attackResponse.Info.SourceIps.Where(p => p.Name != "other").Select(p => p.Name)), false);
-            embed.WithField("📡 | Zdrojové ASN", string.Join("\n", attackResponse.Info.SourceAsns.Where(p => p.Name != "other").Select(p => p.Name)), false);
-
-            embed.WithField("🌐 | Státy", string.Join("\n", attackResponse.Info.SourceCountries.Where(p => p.Name != "other").Select(p => p.Name)), false);
-
-            embed.WithFooter($"ID: {attackResponse.Attack.Id}");
+            embed.WithFooter($"ID: {attackResponse.BaseInfo.Id}");
             return embed;
         }
 
